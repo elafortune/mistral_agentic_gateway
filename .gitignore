@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+vendor/tau2-bench/
+evals/*/results/
+evals/*/traces/
+*.log
+logs/
+langfuse_data/

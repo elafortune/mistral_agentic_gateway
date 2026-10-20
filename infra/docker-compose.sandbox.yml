@@ -1,0 +1,114 @@
+# Étape 4 -- sandbox par composant. Contexte de build = racine du projet
+# (chaque Dockerfile ne copie que ce dont il a besoin, pas tout le repo).
+#
+# Réseaux :
+#   agent_net    (interne, pas d'internet) : agent <-> passerelle <-> proxy d'egress
+#   tools_net    (interne, pas d'internet) : passerelle <-> serveur(s) MCP métier
+#   internet_net (normal)                  : seule la patte externe du proxy d'egress y est
+#
+# L'agent ne peut donc JOINDRE ni le serveur MCP métier (pas sur le même
+# réseau que lui) ni internet directement (agent_net est interne -- seul le
+# proxy, sur agent_net ET internet_net, a une route sortante, et n'autorise
+# que les domaines de la liste blanche, cf. infra/squid/squid.conf).
+
+networks:
+  agent_net:
+    internal: true
+  tools_net:
+    internal: true
+  internet_net: {}
+
+services:
+  mcp-airline:
+    build:
+      context: ..
+      dockerfile: infra/docker/tool_server.Dockerfile
+    networks:
+      - tools_net
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    user: "10001:10001"
+    mem_limit: 384m
+    cpus: 0.5
+    pids_limit: 64
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: infra/docker/gateway.Dockerfile
+    command:
+      ["--policy", "/app/policies/airline.yaml", "--server-name", "airline_mcp", "--upstream-url", "http://mcp-airline:8000/mcp"]
+    env_file:
+      - ../.env
+    environment:
+      # Étape 5 : le vérificateur appelle Gemini (autre fournisseur que
+      # l'agent principal Mistral) -- seul appel sortant de la passerelle,
+      # via le proxy d'egress (liste blanche .googleapis.com). Le trafic vers
+      # le serveur métier (tools_net) ne doit PAS passer par ce proxy.
+      HTTP_PROXY: http://egress-proxy:3128
+      HTTPS_PROXY: http://egress-proxy:3128
+      NO_PROXY: mcp-airline
+    networks:
+      - agent_net
+      - tools_net
+    depends_on:
+      mcp-airline:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_started
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    user: "10001:10001"
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 32
+
+  egress-proxy:
+    image: ubuntu/squid:latest
+    volumes:
+      - ../infra/squid/squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      - agent_net
+      - internet_net
+    cap_drop: ["ALL"]
+    # squid démarre root puis se délite vers son utilisateur interne "proxy"
+    # (setuid/setgid) -- capacités minimales nécessaires à CETTE bascule,
+    # pas un accès root complet. Sans elles, squid plante au démarrage
+    # (assertion sur son propre buffer de logs d'erreurs répétées).
+    cap_add: ["SETUID", "SETGID"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.3
+    pids_limit: 32
+
+  agent:
+    build:
+      context: ..
+      dockerfile: infra/docker/agent.Dockerfile
+    environment:
+      GATEWAY_URL: http://gateway:8100/mcp
+      HTTP_PROXY: http://egress-proxy:3128
+      HTTPS_PROXY: http://egress-proxy:3128
+      NO_PROXY: gateway
+    networks:
+      - agent_net
+    depends_on:
+      gateway:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_started
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    user: "10001:10001"
+    mem_limit: 128m
+    cpus: 0.3
+    pids_limit: 32
